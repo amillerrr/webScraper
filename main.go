@@ -160,14 +160,26 @@ type Scraper struct {
 	storage     Storage
 	robotsCache *RobotsCache
 	userAgent string
+	requestTimeout time.Duration
+	httpClient *http.Client
 }
 
-func NewScraper(requestsPerSecond float64, storage Storage, userAgent string) *Scraper {
+func NewScraper(requestsPerSecond float64, storage Storage, userAgent string, requestTimeout time.Duration) *Scraper {
 	return &Scraper{
 		rateLimiter: rate.NewLimiter(rate.Limit(requestsPerSecond), 1),
 		storage:     storage,
 		robotsCache: NewRobotsCache(),
 		userAgent: userAgent,
+		requestTimeout: requestTimeout,
+		httpClient: &http.Client{
+			Timeout: requestTimeout,
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				if len(via) >= 10 {
+					return fmt.Errorf("too many redirects")
+				}
+				return nil
+			},
+		},
 	}
 }
 
@@ -200,29 +212,40 @@ func normalizeURL(rawURL string, baseURL *url.URL) (string, error) {
 	return parsed.String(), nil
 }
 
-func (s *Scraper) scrapePage(rawURL string) (ScrapedPage, error) {
+func (s *Scraper) scrapePage(ctx context.Context, rawURL string) (ScrapedPage, error) {
+	// Check if context is already cancelled
+	select {
+	case <-ctx.Done():
+		return ScrapedPage{}, ctx.Err()
+	default:
+	}
+
 	// Check robots.txt
 	if !s.robotsCache.CanFetch(rawURL, s.userAgent) {
 		return ScrapedPage{}, fmt.Errorf("disallowed by robots.txt: %s", rawURL)
 	}
 
 	// rate limiter permission step
-	if err := s.rateLimiter.Wait(context.Background()); err != nil {
-		return ScrapedPage{}, err
+	if err := s.rateLimiter.Wait(ctx); err != nil {
+		return ScrapedPage{}, fmt.Errorf("rate limiter wait failed: %w", err)
 	}
 
 	// Create request with User-Agent header
-	req, err := http.NewRequest("GET", rawURL, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", rawURL, nil)
 	if err != nil {
 		return ScrapedPage{}, err
 	}
 	req.Header.Set("User-Agent", s.userAgent)
 
-	resp, err := http.Get(rawURL)
+	resp, err := s.httpClient.Do(req)
 	if err != nil {
 		return ScrapedPage{}, err
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return ScrapedPage{}, fmt.Errorf("bad status code: %d", resp.StatusCode)
+	}
 
 	doc, err := goquery.NewDocumentFromReader(resp.Body)
 	if err != nil {
@@ -273,7 +296,7 @@ func (s *Scraper) scrapePage(rawURL string) (ScrapedPage, error) {
 	return page, nil
 }
 
-func (s *Scraper) ProcessJob(job *ScrapeJob) error {
+func (s *Scraper) ProcessJob(ctx context.Context, job *ScrapeJob) error {
 	job.Status = "running"
 	results := []ScrapedPage{}
 
@@ -290,6 +313,13 @@ func (s *Scraper) ProcessJob(job *ScrapeJob) error {
 	toVisit := []URLDepth{{URL: normalizedStartURL, Depth: 0}}
 
 	for len(toVisit) > 0 && len(results) < job.MaxPages {
+		select {
+		case <-ctx.Done():
+			job.Status = "cancelled"
+			return ctx.Err()
+		default:
+		}
+
 		current := toVisit[0]
 		toVisit = toVisit[1:]
 
@@ -299,7 +329,7 @@ func (s *Scraper) ProcessJob(job *ScrapeJob) error {
 		}
 
 		// Scrape page
-		page, err := s.scrapePage(current.URL)
+		page, err := s.scrapePage(ctx, current.URL)
 		if err != nil {
 			log.Printf("Error scraping %s: %v", current.URL, err)
 			continue
@@ -340,15 +370,26 @@ func NewScrapeJob(url string, depth int, maxPages int) *ScrapeJob {
 
 func main() {
 	storage := NewMemoryStorage()
-
 	userAgent := "WebScraper/1.0 (+https://example.com/bot)"
-	scraper := NewScraper(2.0, storage, userAgent)
+	requestTimeout := 30 * time.Second
+
+	scraper := NewScraper(2.0, storage, userAgent, requestTimeout)
 
 	job := NewScrapeJob("https://example.com", 2, 10)
 	fmt.Printf("Created job %s\n", job.ID)
 
-	if err := scraper.ProcessJob(job); err != nil {
-		log.Fatal(err)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	// Process job with context
+	if err := scraper.ProcessJob(ctx, job); err != nil {
+		if err == context.DeadlineExceeded {
+			log.Printf("Job %s timed out after 5 minutes", job.ID)
+		} else if err == context.Canceled {
+			log.Printf("Job %s was cancelled", job.ID)
+		} else {
+			log.Fatal(err)
+		}
 	}
 
 	// Retrieve from storage
