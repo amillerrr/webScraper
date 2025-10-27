@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -94,13 +96,42 @@ func NewScraper(requestsPerSecond float64, storage Storage) *Scraper {
 	}
 }
 
-func (s *Scraper) scrapePage(url string) (ScrapedPage, error) {
+func normalizeURL(rawURL string, baseURL *url.URL) (string, error) {
+	// Parse URL
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return "", err
+	}
+
+	// Convert to absolute URLs
+	if !parsed.IsAbs() {
+		parsed = baseURL.ResolveReference(parsed)
+	}
+
+	// Remove fragments
+	parsed.Fragment = ""
+
+	parsed.Scheme = strings.ToLower(parsed.Scheme)
+	parsed.Host = strings.ToLower(parsed.Host)
+
+	if parsed.Path != "/" && strings.HasSuffix(parsed.Path, "/") {
+		parsed.Path = strings.TrimSuffix(parsed.Path, "/")
+	}
+
+	if (parsed.Scheme == "http" && strings.HasSuffix(parsed.Host, ":80")) || (parsed.Scheme == "https" && strings.HasSuffix(parsed.Host, ":443")) {
+		parsed.Host = strings.Split(parsed.Host, ":")[0]
+	}
+
+	return parsed.String(), nil
+}
+
+func (s *Scraper) scrapePage(rawURL string) (ScrapedPage, error) {
 	// rate limiter permission step
 	if err := s.rateLimiter.Wait(context.Background()); err != nil {
 		return ScrapedPage{}, err
 	}
 
-	resp, err := http.Get(url)
+	resp, err := http.Get(rawURL)
 	if err != nil {
 		return ScrapedPage{}, err
 	}
@@ -111,8 +142,13 @@ func (s *Scraper) scrapePage(url string) (ScrapedPage, error) {
 		return ScrapedPage{}, err
 	}
 
+	baseURL, err := url.Parse(rawURL)
+	if err != nil {
+		return ScrapedPage{}, err
+	}
+
 	page := ScrapedPage{
-		URL:       url,
+		URL:       rawURL,
 		Title:     doc.Find("title").Text(),
 		ScrapedAt: time.Now(),
 		Links:     []string{},
@@ -122,14 +158,28 @@ func (s *Scraper) scrapePage(url string) (ScrapedPage, error) {
 	// Extract Links
 	doc.Find("a[href]").Each(func(i int, s *goquery.Selection) {
 		if href, exists := s.Attr("href"); exists {
-			page.Links = append(page.Links, href)
+			// Normalize url
+			normalizedURL, err := normalizeURL(href, baseURL)
+			if err != nil {
+				log.Printf("Failed to normalize URL %s: %v", href, err)
+				return
+			}
+
+			if strings.HasPrefix(normalizedURL, "http://") || strings.HasPrefix(normalizedURL, "https://") {
+				page.Links = append(page.Links, normalizedURL)
+			}
 		}
 	})
 
 	// Extract images
 	doc.Find("img[src]").Each(func(i int, s *goquery.Selection) {
 		if src, exists := s.Attr("src"); exists {
-			page.Images = append(page.Images, src)
+			normalizedURL, err := normalizeURL(src, baseURL)
+			if err != nil {
+				log.Printf("Failed to normalize image URL %s: %v", src, err)
+				return
+			}
+			page.Images = append(page.Images, normalizedURL)
 		}
 	})
 
@@ -140,8 +190,17 @@ func (s *Scraper) ProcessJob(job *ScrapeJob) error {
 	job.Status = "running"
 	results := []ScrapedPage{}
 
+	parsedStartURL, err := url.Parse(job.URL)
+	if err != nil {
+		return fmt.Errorf("invalid start URL: %w", err)
+	}
+	normalizedStartURL, err := normalizeURL(job.URL, parsedStartURL)
+	if err != nil {
+		return fmt.Errorf("failed to normalize start URL: %w", err)
+	}
+
 	// BFS queue from initial URL
-	toVisit := []URLDepth{{URL: job.URL, Depth: 0}}
+	toVisit := []URLDepth{{URL: normalizedStartURL, Depth: 0}}
 
 	for len(toVisit) > 0 && len(results) < job.MaxPages {
 		current := toVisit[0]
