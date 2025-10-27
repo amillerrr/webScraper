@@ -14,26 +14,26 @@ import (
 )
 
 type ScrapeJob struct {
-	ID string
-	URL string
-	Depth int
-	MaxPages int
-	Status string
-	CreatedAt time.Time
+	ID          string
+	URL         string
+	Depth       int
+	MaxPages    int
+	Status      string
+	CreatedAt   time.Time
 	CompletedAt *time.Time
-	Results []ScrapedPage
+	Results     []ScrapedPage
 }
 
 type ScrapedPage struct {
-	URL string
-	Title string
-	Links []string
-	Images []string
+	URL       string
+	Title     string
+	Links     []string
+	Images    []string
 	ScrapedAt time.Time
 }
 
 type URLDepth struct {
-	URL string
+	URL   string
 	Depth int
 }
 
@@ -44,7 +44,7 @@ type Storage interface {
 }
 
 type MemoryStorage struct {
-	mu sync.RWMutex
+	mu   sync.RWMutex
 	jobs map[string]*ScrapeJob
 }
 
@@ -82,15 +82,15 @@ func (m *MemoryStorage) ListJobs() ([]*ScrapeJob, error) {
 }
 
 type Scraper struct {
-	visited sync.Map
+	visited     sync.Map
 	rateLimiter *rate.Limiter
-	storage Storage
+	storage     Storage
 }
 
 func NewScraper(requestsPerSecond float64, storage Storage) *Scraper {
 	return &Scraper{
 		rateLimiter: rate.NewLimiter(rate.Limit(requestsPerSecond), 1),
-		storage: storage,
+		storage:     storage,
 	}
 }
 
@@ -112,11 +112,11 @@ func (s *Scraper) scrapePage(url string) (ScrapedPage, error) {
 	}
 
 	page := ScrapedPage{
-		URL: url,
-		Title: doc.Find("title").Text(),
+		URL:       url,
+		Title:     doc.Find("title").Text(),
 		ScrapedAt: time.Now(),
-		Links: []string{},
-		Images: []string{},
+		Links:     []string{},
+		Images:    []string{},
 	}
 
 	// Extract Links
@@ -165,13 +165,13 @@ func (s *Scraper) ProcessJob(job *ScrapeJob) error {
 		if current.Depth < job.Depth {
 			for _, link := range page.Links {
 				toVisit = append(toVisit, URLDepth{
-					URL: link,
+					URL:   link,
 					Depth: current.Depth + 1,
 				})
 			}
 		}
 	}
-	
+
 	job.Results = results
 	job.Status = "completed"
 	now := time.Now()
@@ -182,13 +182,13 @@ func (s *Scraper) ProcessJob(job *ScrapeJob) error {
 
 func NewScrapeJob(url string, depth int, maxPages int) *ScrapeJob {
 	return &ScrapeJob{
-		ID: uuid.New().String(),
-		URL: url,
-		Depth: depth,
-		MaxPages: maxPages,
-		Status: "pending",
+		ID:        uuid.New().String(),
+		URL:       url,
+		Depth:     depth,
+		MaxPages:  maxPages,
+		Status:    "pending",
 		CreatedAt: time.Now(),
-		Results: []ScrapedPage{},
+		Results:   []ScrapedPage{},
 	}
 }
 
