@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
@@ -37,13 +38,12 @@ type URLDepth struct {
 }
 
 type Scraper struct {
-	visited map[string]bool
+	visited sync.Map
 	rateLimiter *rate.Limiter
 }
 
 func NewScraper(requestsPerSecond float64) *Scraper {
 	return &Scraper{
-		visited: make(map[string]bool),
 		rateLimiter: rate.NewLimiter(rate.Limit(requestsPerSecond), 1),
 	}
 }
@@ -102,10 +102,9 @@ func (s *Scraper) ProcessJob(job *ScrapeJob) error {
 		toVisit = toVisit[1:]
 
 		// Skip visted URLs
-		if s.visited[current.URL] {
+		if _, visited := s.visited.LoadOrStore(current.URL, true); visited {
 			continue
 		}
-		s.visited[current.URL] = true
 
 		// Scrape page
 		page, err := s.scrapePage(current.URL)
@@ -119,12 +118,10 @@ func (s *Scraper) ProcessJob(job *ScrapeJob) error {
 		// Add child links if still not at max depth
 		if current.Depth < job.Depth {
 			for _, link := range page.Links {
-				if !s.visited[link] {
-					toVisit = append(toVisit, URLDepth{
-						URL: link,
-						Depth: current.Depth + 1,
-					})
-				}
+				toVisit = append(toVisit, URLDepth{
+					URL: link,
+					Depth: current.Depth + 1,
+				})
 			}
 		}
 	}
