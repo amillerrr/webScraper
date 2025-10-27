@@ -37,14 +37,60 @@ type URLDepth struct {
 	Depth int
 }
 
+type Storage interface {
+	SaveJob(job *ScrapeJob) error
+	GetJob(id string) (*ScrapeJob, error)
+	ListJobs() ([]*ScrapeJob, error)
+}
+
+type MemoryStorage struct {
+	mu sync.RWMutex
+	jobs map[string]*ScrapeJob
+}
+
+func NewMemoryStorage() *MemoryStorage {
+	return &MemoryStorage{
+		jobs: make(map[string]*ScrapeJob),
+	}
+}
+
+func (m *MemoryStorage) SaveJob(job *ScrapeJob) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.jobs[job.ID] = job
+	return nil
+}
+
+func (m *MemoryStorage) GetJob(id string) (*ScrapeJob, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	job, exists := m.jobs[id]
+	if !exists {
+		return nil, fmt.Errorf("job not found: %s", id)
+	}
+	return job, nil
+}
+
+func (m *MemoryStorage) ListJobs() ([]*ScrapeJob, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	jobs := make([]*ScrapeJob, 0, len(m.jobs))
+	for _, job := range m.jobs {
+		jobs = append(jobs, job)
+	}
+	return jobs, nil
+}
+
 type Scraper struct {
 	visited sync.Map
 	rateLimiter *rate.Limiter
+	storage Storage
 }
 
-func NewScraper(requestsPerSecond float64) *Scraper {
+func NewScraper(requestsPerSecond float64, storage Storage) *Scraper {
 	return &Scraper{
 		rateLimiter: rate.NewLimiter(rate.Limit(requestsPerSecond), 1),
+		storage: storage,
 	}
 }
 
@@ -147,7 +193,8 @@ func NewScrapeJob(url string, depth int, maxPages int) *ScrapeJob {
 }
 
 func main() {
-	scraper := NewScraper(2.0)
+	storage := NewMemoryStorage()
+	scraper := NewScraper(2.0, storage)
 
 	job := NewScrapeJob("https://example.com", 2, 10)
 	fmt.Printf("Created job %s\n", job.ID)
@@ -156,6 +203,11 @@ func main() {
 		log.Fatal(err)
 	}
 
-	fmt.Printf("Job %s completed in %v\n", job.ID, job.CompletedAt.Sub(job.CreatedAt))
-	fmt.Printf("Scraped %d pages\n", len(job.Results))
+	// Retrieve from storage
+	savedJob, err := storage.GetJob(job.ID)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	fmt.Printf("Job %s: scraped %d pages\n", savedJob.ID, len(savedJob.Results))
 }
