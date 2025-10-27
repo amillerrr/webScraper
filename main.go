@@ -17,6 +17,11 @@ type ScrapedPage struct {
 	ScrapedAt time.Time
 }
 
+type URLDepth struct {
+	URL string
+	Depth int
+}
+
 func scrapePage(url string) (ScrapedPage, error) {
 	resp, err := http.Get(url)
 	if err != nil {
@@ -47,20 +52,47 @@ func scrapePage(url string) (ScrapedPage, error) {
 	// Extract images
 	doc.Find("img[src]").Each(func(i int, s *goquery.Selection) {
 		if src, exists := s.Attr("src"); exists {
-			page.Links = append(page.Links, src)
+			page.Images = append(page.Images, src)
 		}
 	})
 
 	return page, nil
 }
 
-func main() {
-	page, err := scrapePage("https://example.com")
-	if err != nil {
-		log.Fatal(err)
-	}
+func crawl(startURL string, maxDepth int, maxPages int) []ScrapedPage {
+	results := []ScrapedPage{}
 
-	fmt.Printf("URL: %s\n", page.URL)
-	fmt.Printf("Title: %s\n", page.Title)
-	fmt.Printf("Found %d links and %d images\n", len(page.Links), len(page.Images))
+	// BFS queue from initial URL
+	toVisit := []URLDepth{{URL: startURL, Depth: 0}}
+
+	for len(toVisit) > 0 && len(results) < maxPages {
+		current := toVisit[0]
+		toVisit = toVisit[1:]
+
+		// Scrape page
+		page, err := scrapePage(current.URL)
+		if err != nil {
+			log.Printf("Error scraping %s: %v", current.URL, err)
+			continue
+		}
+
+		results = append(results, page)
+		fmt.Printf("Scraped: %s (depth %d)\n", current.URL, current.Depth)
+
+		// Add child links if still not at max depth
+		if current.Depth < maxDepth {
+			for _, link := range page.Links {
+				toVisit = append(toVisit, URLDepth{
+					URL: link,
+					Depth: current.Depth + 1,
+				})
+			}
+		}
+	}
+	return results
+}
+
+func main() {
+	results := crawl("https://example.com", 2, 10)
+	fmt.Printf("\nTotal pages scraped: %d\n", len(results))
 }
