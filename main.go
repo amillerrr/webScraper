@@ -162,15 +162,17 @@ type Scraper struct {
 	userAgent string
 	requestTimeout time.Duration
 	httpClient *http.Client
+	numWorkers int
 }
 
-func NewScraper(requestsPerSecond float64, storage Storage, userAgent string, requestTimeout time.Duration) *Scraper {
+func NewScraper(requestsPerSecond float64, storage Storage, userAgent string, requestTimeout time.Duration, numWorkers int) *Scraper {
 	return &Scraper{
 		rateLimiter: rate.NewLimiter(rate.Limit(requestsPerSecond), 1),
 		storage:     storage,
 		robotsCache: NewRobotsCache(),
 		userAgent: userAgent,
 		requestTimeout: requestTimeout,
+		numWorkers: numWorkers,
 		httpClient: &http.Client{
 			Timeout: requestTimeout,
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {
@@ -296,9 +298,59 @@ func (s *Scraper) scrapePage(ctx context.Context, rawURL string) (ScrapedPage, e
 	return page, nil
 }
 
+func (s *Scraper) worker(ctx context.Context, urlChan <-chan URLDepth, resultChan chan<- ScrapedPage, linksChan chan<- []URLDepth, wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case urlDepth, ok := <-urlChan:
+			if !ok {
+				return
+			}
+
+			// Check if visited
+			if _, visited := s.visited.LoadOrStore(urlDepth.URL, true); visited {
+				continue
+			}
+
+			// Scrape the page
+			page, err := s.scrapePage(ctx, urlDepth.URL)
+			if err != nil {
+				log.Printf("Worker error scraping %s: %v", urlDepth.URL, err)
+				continue
+			}
+
+			// Send result
+			select {
+			case resultChan <- page:
+			case <-ctx.Done():
+				return
+			}
+
+			// Send discovered links with depth
+			discoveredLinks := make([]URLDepth, 0, len(page.Links))
+			for _, link := range page.Links {
+				discoveredLinks = append(discoveredLinks, URLDepth{
+					URL:   link,
+					Depth: urlDepth.Depth + 1,
+				})
+			}
+
+			if len(discoveredLinks) > 0 {
+				select {
+				case linksChan <- discoveredLinks:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}
+	}
+}
+
 func (s *Scraper) ProcessJob(ctx context.Context, job *ScrapeJob) error {
 	job.Status = "running"
-	results := []ScrapedPage{}
 
 	parsedStartURL, err := url.Parse(job.URL)
 	if err != nil {
@@ -309,51 +361,116 @@ func (s *Scraper) ProcessJob(ctx context.Context, job *ScrapeJob) error {
 		return fmt.Errorf("failed to normalize start URL: %w", err)
 	}
 
-	// BFS queue from initial URL
-	toVisit := []URLDepth{{URL: normalizedStartURL, Depth: 0}}
+	// Channels for coordinating workers
+	urlChan := make(chan URLDepth, 100) // Buffer to avoid blocking
+	resultChan := make(chan ScrapedPage, 100) // Buffer for results
+	linksChan := make(chan []URLDepth, 100) // Buffer for discovered links
+	
+	var wg sync.WaitGroup
 
-	for len(toVisit) > 0 && len(results) < job.MaxPages {
-		select {
-		case <-ctx.Done():
-			job.Status = "cancelled"
-			return ctx.Err()
-		default:
-		}
+	// Start worker pool
+	for i := 0; i < s.numWorkers; i++ {
+		wg.Add(1)
+		go s.worker(ctx, urlChan, resultChan, linksChan, &wg)
+	}
 
-		current := toVisit[0]
-		toVisit = toVisit[1:]
-
-		// Skip visted URLs
-		if _, visited := s.visited.LoadOrStore(current.URL, true); visited {
-			continue
-		}
-
-		// Scrape page
-		page, err := s.scrapePage(ctx, current.URL)
-		if err != nil {
-			log.Printf("Error scraping %s: %v", current.URL, err)
-			continue
-		}
-
-		results = append(results, page)
-
-		// Add child links if still not at max depth
-		if current.Depth < job.Depth {
-			for _, link := range page.Links {
-				toVisit = append(toVisit, URLDepth{
-					URL:   link,
-					Depth: current.Depth + 1,
-				})
+	results := []ScrapedPage{}
+	resultCountChan := make(chan int, 100) // FIX: Separate channel for counting
+	collectorDone := make(chan struct{})
+	go func() {
+		defer close(collectorDone)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case page, ok := <-resultChan:
+				if !ok {
+					return
+				}
+				results = append(results, page)
+				// FIX: Signal coordinator that we got a result
+				select {
+				case resultCountChan <- len(results):
+				case <-ctx.Done():
+					return
+				}
 			}
 		}
-	}
+	}()
+
+	// manage BFS queue
+	coordinatorDone := make(chan struct{})
+	go func() {
+		defer close(coordinatorDone)
+		defer close(resultCountChan)
+
+		toVisit := []URLDepth{{URL: normalizedStartURL, Depth: 0}}
+		pagesScraped := 0
+
+		// Send initial URL
+		select {
+		case urlChan <- toVisit[0]:
+			toVisit = toVisit[1:]
+		case <-ctx.Done():
+			return
+		}
+
+		for pagesScraped < job.MaxPages {
+			select {
+			case <-ctx.Done():
+				return
+
+			case discoveredLinks := <-linksChan:
+				// Add discovered links to queue if within depth limit
+				for _, link := range discoveredLinks {
+					if link.Depth <= job.Depth {
+						toVisit = append(toVisit, link)
+					}
+				}
+
+			case count := <-resultCountChan:
+				pagesScraped = count
+
+				// Send next URL to workers if available
+				if len(toVisit) > 0 && pagesScraped < job.MaxPages {
+					select {
+					case urlChan <- toVisit[0]:
+						toVisit = toVisit[1:]
+					case <-ctx.Done():
+						return
+					}
+				}
+
+				// Stop if limits reached
+				if pagesScraped >= job.MaxPages || len(toVisit) == 0 {
+					return
+				}
+			}
+		}
+	}()
+
+	// Wait for coordinator to finish
+	<-coordinatorDone
+
+	// Close URL channel to signal workers to stop
+	close(urlChan)
+
+	// Wait for all workers to finish
+	wg.Wait()
+
+	// Close channels
+	close(resultChan)
+	close(linksChan)
+
+	// Wait for collector to finish
+	<-collectorDone
 
 	job.Results = results
 	job.Status = "completed"
 	now := time.Now()
 	job.CompletedAt = &now
 
-	return nil
+	return s.storage.SaveJob(job)
 }
 
 func NewScrapeJob(url string, depth int, maxPages int) *ScrapeJob {
@@ -372,16 +489,18 @@ func main() {
 	storage := NewMemoryStorage()
 	userAgent := "WebScraper/1.0 (+https://example.com/bot)"
 	requestTimeout := 30 * time.Second
+	numWorkers := 5
 
-	scraper := NewScraper(2.0, storage, userAgent, requestTimeout)
+	scraper := NewScraper(2.0, storage, userAgent, requestTimeout, numWorkers)
 
 	job := NewScrapeJob("https://example.com", 2, 10)
-	fmt.Printf("Created job %s\n", job.ID)
+	fmt.Printf("Created job %s with %d workers\n", job.ID, numWorkers)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
 	// Process job with context
+	startTime := time.Now()
 	if err := scraper.ProcessJob(ctx, job); err != nil {
 		if err == context.DeadlineExceeded {
 			log.Printf("Job %s timed out after 5 minutes", job.ID)
@@ -391,12 +510,7 @@ func main() {
 			log.Fatal(err)
 		}
 	}
+	duration := time.Since(startTime)
 
-	// Retrieve from storage
-	savedJob, err := storage.GetJob(job.ID)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	fmt.Printf("Job %s: scraped %d pages\n", savedJob.ID, len(savedJob.Results))
+	fmt.Printf("Job %s: scraped %d pages in %v\n", job.ID, len(job.Results), duration)
 }
