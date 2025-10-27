@@ -12,6 +12,7 @@ import (
 
 	"github.com/PuerkitoBio/goquery"
 	"github.com/google/uuid"
+	"github.com/temoto/robotstxt"
 	"golang.org/x/time/rate"
 )
 
@@ -83,16 +84,90 @@ func (m *MemoryStorage) ListJobs() ([]*ScrapeJob, error) {
 	return jobs, nil
 }
 
+type RobotsCache struct {
+	mu sync.RWMutex
+	cache map[string]*robotstxt.RobotsData
+}
+
+func NewRobotsCache() *RobotsCache {
+	return &RobotsCache{
+		cache: make(map[string]*robotstxt.RobotsData),
+	}
+}
+
+// fetch and cache robots.txt
+func (rc *RobotsCache) getRobots(domain string) (*robotstxt.RobotsData, error) {
+	// Check cache first
+	rc.mu.RLock()
+	if robots, exists := rc.cache[domain]; exists {
+		rc.mu.RUnlock()
+		return robots, nil
+	}
+	rc.mu.RUnlock()
+
+	// Fetch if not in cache
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+
+	// Double-check after acquiring write lock
+	if robots, exists := rc.cache[domain]; exists {
+		return robots, nil
+	}
+
+	robotsURL := fmt.Sprintf("%s/robots.txt", domain)
+	resp, err := http.Get(robotsURL)
+	if err != nil {
+		// If robots.txt doesn't exist, assume everything is allowed
+		log.Printf("No robots.txt found for %s, allowing all: %v", domain, err)
+		robots := &robotstxt.RobotsData{}
+		rc.cache[domain] = robots
+		return robots, nil
+	}
+	defer resp.Body.Close()
+
+	// Parse 
+	robots, err := robotstxt.FromResponse(resp)
+	if err != nil {
+		log.Printf("Failed to parse robots.txt for %s: %v", domain, err)
+		robots = &robotstxt.RobotsData{} // Allow all on parse error
+	}
+
+	rc.cache[domain] = robots
+	return robots, nil
+}
+
+// Check permission to fetch url
+func (rc *RobotsCache) CanFetch(urlStr string, userAgent string) bool {
+	parsed, err := url.Parse(urlStr)
+	if err != nil {
+		return false
+	}
+
+	domain := fmt.Sprintf("%s://%s", parsed.Scheme, parsed.Host)
+	robots, err := rc.getRobots(domain)
+	if err != nil {
+		return false
+	}
+
+	// Check if our user agent is allowed to fetch this path
+	group := robots.FindGroup(userAgent)
+	return group.Test(parsed.Path)
+}
+
 type Scraper struct {
 	visited     sync.Map
 	rateLimiter *rate.Limiter
 	storage     Storage
+	robotsCache *RobotsCache
+	userAgent string
 }
 
-func NewScraper(requestsPerSecond float64, storage Storage) *Scraper {
+func NewScraper(requestsPerSecond float64, storage Storage, userAgent string) *Scraper {
 	return &Scraper{
 		rateLimiter: rate.NewLimiter(rate.Limit(requestsPerSecond), 1),
 		storage:     storage,
+		robotsCache: NewRobotsCache(),
+		userAgent: userAgent,
 	}
 }
 
@@ -126,10 +201,22 @@ func normalizeURL(rawURL string, baseURL *url.URL) (string, error) {
 }
 
 func (s *Scraper) scrapePage(rawURL string) (ScrapedPage, error) {
+	// Check robots.txt
+	if !s.robotsCache.CanFetch(rawURL, s.userAgent) {
+		return ScrapedPage{}, fmt.Errorf("disallowed by robots.txt: %s", rawURL)
+	}
+
 	// rate limiter permission step
 	if err := s.rateLimiter.Wait(context.Background()); err != nil {
 		return ScrapedPage{}, err
 	}
+
+	// Create request with User-Agent header
+	req, err := http.NewRequest("GET", rawURL, nil)
+	if err != nil {
+		return ScrapedPage{}, err
+	}
+	req.Header.Set("User-Agent", s.userAgent)
 
 	resp, err := http.Get(rawURL)
 	if err != nil {
@@ -253,7 +340,9 @@ func NewScrapeJob(url string, depth int, maxPages int) *ScrapeJob {
 
 func main() {
 	storage := NewMemoryStorage()
-	scraper := NewScraper(2.0, storage)
+
+	userAgent := "WebScraper/1.0 (+https://example.com/bot)"
+	scraper := NewScraper(2.0, storage, userAgent)
 
 	job := NewScrapeJob("https://example.com", 2, 10)
 	fmt.Printf("Created job %s\n", job.ID)
