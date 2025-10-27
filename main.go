@@ -8,8 +8,20 @@ import (
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
+	"github.com/google/uuid"
 	"golang.org/x/time/rate"
 )
+
+type ScrapeJob struct {
+	ID string
+	URL string
+	Depth int
+	MaxPages int
+	Status string
+	CreatedAt time.Time
+	CompletedAt *time.Time
+	Results []ScrapedPage
+}
 
 type ScrapedPage struct {
 	URL string
@@ -78,13 +90,14 @@ func (s *Scraper) scrapePage(url string) (ScrapedPage, error) {
 	return page, nil
 }
 
-func (s *Scraper) crawl(startURL string, maxDepth int, maxPages int) []ScrapedPage {
+func (s *Scraper) ProcessJob(job *ScrapeJob) error {
+	job.Status = "running"
 	results := []ScrapedPage{}
 
 	// BFS queue from initial URL
-	toVisit := []URLDepth{{URL: startURL, Depth: 0}}
+	toVisit := []URLDepth{{URL: job.URL, Depth: 0}}
 
-	for len(toVisit) > 0 && len(results) < maxPages {
+	for len(toVisit) > 0 && len(results) < job.MaxPages {
 		current := toVisit[0]
 		toVisit = toVisit[1:]
 
@@ -102,10 +115,9 @@ func (s *Scraper) crawl(startURL string, maxDepth int, maxPages int) []ScrapedPa
 		}
 
 		results = append(results, page)
-		fmt.Printf("Scraped: %s (depth %d)\n", current.URL, current.Depth)
 
 		// Add child links if still not at max depth
-		if current.Depth < maxDepth {
+		if current.Depth < job.Depth {
 			for _, link := range page.Links {
 				if !s.visited[link] {
 					toVisit = append(toVisit, URLDepth{
@@ -116,11 +128,37 @@ func (s *Scraper) crawl(startURL string, maxDepth int, maxPages int) []ScrapedPa
 			}
 		}
 	}
-	return results
+	
+	job.Results = results
+	job.Status = "completed"
+	now := time.Now()
+	job.CompletedAt = &now
+
+	return nil
+}
+
+func NewScrapeJob(url string, depth int, maxPages int) *ScrapeJob {
+	return &ScrapeJob{
+		ID: uuid.New().String(),
+		URL: url,
+		Depth: depth,
+		MaxPages: maxPages,
+		Status: "pending",
+		CreatedAt: time.Now(),
+		Results: []ScrapedPage{},
+	}
 }
 
 func main() {
 	scraper := NewScraper(2.0)
-	results := scraper.crawl("https://example.com", 2, 10)
-	fmt.Printf("\nTotal pages scraped: %d\n", len(results))
+
+	job := NewScrapeJob("https://example.com", 2, 10)
+	fmt.Printf("Created job %s\n", job.ID)
+
+	if err := scraper.ProcessJob(job); err != nil {
+		log.Fatal(err)
+	}
+
+	fmt.Printf("Job %s completed in %v\n", job.ID, job.CompletedAt.Sub(job.CreatedAt))
+	fmt.Printf("Scraped %d pages\n", len(job.Results))
 }
