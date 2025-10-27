@@ -1,12 +1,14 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"net/http"
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
+	"golang.org/x/time/rate"
 )
 
 type ScrapedPage struct {
@@ -24,15 +26,22 @@ type URLDepth struct {
 
 type Scraper struct {
 	visited map[string]bool
+	rateLimiter *rate.Limiter
 }
 
-func NewScraper() *Scraper {
+func NewScraper(requestsPerSecond float64) *Scraper {
 	return &Scraper{
 		visited: make(map[string]bool),
+		rateLimiter: rate.NewLimiter(rate.Limit(requestsPerSecond), 1),
 	}
 }
 
 func (s *Scraper) scrapePage(url string) (ScrapedPage, error) {
+	// rate limiter permission step
+	if err := s.rateLimiter.Wait(context.Background()); err != nil {
+		return ScrapedPage{}, err
+	}
+
 	resp, err := http.Get(url)
 	if err != nil {
 		return ScrapedPage{}, err
@@ -111,7 +120,7 @@ func (s *Scraper) crawl(startURL string, maxDepth int, maxPages int) []ScrapedPa
 }
 
 func main() {
-	scraper := NewScraper()
+	scraper := NewScraper(2.0)
 	results := scraper.crawl("https://example.com", 2, 10)
 	fmt.Printf("\nTotal pages scraped: %d\n", len(results))
 }
