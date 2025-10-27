@@ -22,7 +22,17 @@ type URLDepth struct {
 	Depth int
 }
 
-func scrapePage(url string) (ScrapedPage, error) {
+type Scraper struct {
+	visited map[string]bool
+}
+
+func NewScraper() *Scraper {
+	return &Scraper{
+		visited: make(map[string]bool),
+	}
+}
+
+func (s *Scraper) scrapePage(url string) (ScrapedPage, error) {
 	resp, err := http.Get(url)
 	if err != nil {
 		return ScrapedPage{}, err
@@ -59,7 +69,7 @@ func scrapePage(url string) (ScrapedPage, error) {
 	return page, nil
 }
 
-func crawl(startURL string, maxDepth int, maxPages int) []ScrapedPage {
+func (s *Scraper) crawl(startURL string, maxDepth int, maxPages int) []ScrapedPage {
 	results := []ScrapedPage{}
 
 	// BFS queue from initial URL
@@ -69,8 +79,14 @@ func crawl(startURL string, maxDepth int, maxPages int) []ScrapedPage {
 		current := toVisit[0]
 		toVisit = toVisit[1:]
 
+		// Skip visted URLs
+		if s.visited[current.URL] {
+			continue
+		}
+		s.visited[current.URL] = true
+
 		// Scrape page
-		page, err := scrapePage(current.URL)
+		page, err := s.scrapePage(current.URL)
 		if err != nil {
 			log.Printf("Error scraping %s: %v", current.URL, err)
 			continue
@@ -82,10 +98,12 @@ func crawl(startURL string, maxDepth int, maxPages int) []ScrapedPage {
 		// Add child links if still not at max depth
 		if current.Depth < maxDepth {
 			for _, link := range page.Links {
-				toVisit = append(toVisit, URLDepth{
-					URL: link,
-					Depth: current.Depth + 1,
-				})
+				if !s.visited[link] {
+					toVisit = append(toVisit, URLDepth{
+						URL: link,
+						Depth: current.Depth + 1,
+					})
+				}
 			}
 		}
 	}
@@ -93,6 +111,7 @@ func crawl(startURL string, maxDepth int, maxPages int) []ScrapedPage {
 }
 
 func main() {
-	results := crawl("https://example.com", 2, 10)
+	scraper := NewScraper()
+	results := scraper.crawl("https://example.com", 2, 10)
 	fmt.Printf("\nTotal pages scraped: %d\n", len(results))
 }
