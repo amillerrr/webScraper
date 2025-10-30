@@ -85,7 +85,7 @@ func (m *MemoryStorage) ListJobs() ([]*ScrapeJob, error) {
 }
 
 type RobotsCache struct {
-	mu sync.RWMutex
+	mu    sync.RWMutex
 	cache map[string]*robotstxt.RobotsData
 }
 
@@ -125,7 +125,7 @@ func (rc *RobotsCache) getRobots(domain string) (*robotstxt.RobotsData, error) {
 	}
 	defer resp.Body.Close()
 
-	// Parse 
+	// Parse
 	robots, err := robotstxt.FromResponse(resp)
 	if err != nil {
 		log.Printf("Failed to parse robots.txt for %s: %v", domain, err)
@@ -155,24 +155,24 @@ func (rc *RobotsCache) CanFetch(urlStr string, userAgent string) bool {
 }
 
 type Scraper struct {
-	visited     sync.Map
-	rateLimiter *rate.Limiter
-	storage     Storage
-	robotsCache *RobotsCache
-	userAgent string
+	visited        sync.Map
+	rateLimiter    *rate.Limiter
+	storage        Storage
+	robotsCache    *RobotsCache
+	userAgent      string
 	requestTimeout time.Duration
-	httpClient *http.Client
-	numWorkers int
+	httpClient     *http.Client
+	numWorkers     int
 }
 
 func NewScraper(requestsPerSecond float64, storage Storage, userAgent string, requestTimeout time.Duration, numWorkers int) *Scraper {
 	return &Scraper{
-		rateLimiter: rate.NewLimiter(rate.Limit(requestsPerSecond), 1),
-		storage:     storage,
-		robotsCache: NewRobotsCache(),
-		userAgent: userAgent,
+		rateLimiter:    rate.NewLimiter(rate.Limit(requestsPerSecond), 1),
+		storage:        storage,
+		robotsCache:    NewRobotsCache(),
+		userAgent:      userAgent,
 		requestTimeout: requestTimeout,
-		numWorkers: numWorkers,
+		numWorkers:     numWorkers,
 		httpClient: &http.Client{
 			Timeout: requestTimeout,
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {
@@ -362,10 +362,10 @@ func (s *Scraper) ProcessJob(ctx context.Context, job *ScrapeJob) error {
 	}
 
 	// Channels for coordinating workers
-	urlChan := make(chan URLDepth, 100) // Buffer to avoid blocking
+	urlChan := make(chan URLDepth, 100)       // Buffer to avoid blocking
 	resultChan := make(chan ScrapedPage, 100) // Buffer for results
-	linksChan := make(chan []URLDepth, 100) // Buffer for discovered links
-	
+	linksChan := make(chan []URLDepth, 100)   // Buffer for discovered links
+
 	var wg sync.WaitGroup
 
 	// Start worker pool
